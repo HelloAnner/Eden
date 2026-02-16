@@ -1,0 +1,32 @@
+[site]
+title = "Agent"
+subtitle = "技术与生活"
+description = "专注于 Agent 工程、MCP、工作流编排与知识自动化的技术博客"
+icon = "site/favicon.svg"
+
+[footer]
+copyright = "© 2026 Anner. All rights reserved."
+
+[profile]
+name = "Anner"
+role = "Agent 工程师"
+bio = "专注 Agent 工程实践，长期关注 MCP、工具链编排、知识系统与工程化落地。持续记录真实项目中的方案、踩坑与复盘。"
+avatar = "avatar.png"
+github = "https://github.com/HelloAnner"
+email = "helloanner@gmail.com"
+twitter = "https://x.com"
+zhihu = "https://www.zhihu.com/people/ji-zhan-deng-huo-80/posts"
+xiaohongshu = "https://www.xiaohongshu.com/user/profile/5c5fa452000000001101d196"
+douyin = "https://www.douyin.com"
+
+[subscribe]
+title = "订阅博客更新"
+description = "输入您的邮箱地址，第一时间获取最新文章推送。我们承诺不会发送垃圾邮件，您可以随时取消订阅。"
+placeholder = "请输入您的邮箱地址"
+button_text = "立即订阅"
+privacy_note = "您的邮箱信息将被严格保密"
+benefits = [
+  "每周精选技术文章推送",
+  "独家技术资料和学习资源",
+  "新文章发布即时通知",
+]
