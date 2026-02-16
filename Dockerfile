@@ -23,12 +23,13 @@ COPY --from=backend-build /out/blog-server /app/blog-server
 COPY --from=frontend-build /workspace/frontend/dist /app/web
 COPY config.toml /app/config.toml
 
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data /app/logs
 
 ENV PORT=20260
 ENV APP_ROOT=/app
 ENV CONFIG_PATH=/app/config.toml
 ENV DATA_DIR=/app/data
+ENV LOG_DIR=/app/logs
 ENV WEB_DIR=/app/web
 ENV TZ=Asia/Shanghai
 

@@ -6,6 +6,7 @@ HOST_PORT ?= 20260
 
 start:
 	@mkdir -p data
+	@mkdir -p logs
 	@echo "Building docker image $(IMAGE)..."
 	@docker build -t $(IMAGE) .
 	@echo "Restarting container $(CONTAINER)..."
@@ -14,6 +15,7 @@ start:
 		--name $(CONTAINER) \
 		-p $(HOST_PORT):20260 \
 		-v $(CURDIR)/data:/app/data \
+		-v $(CURDIR)/logs:/app/logs \
 		-v $(CURDIR)/config.toml:/app/config.toml \
 		$(IMAGE)
 	@echo "Started: http://localhost:$(HOST_PORT)"

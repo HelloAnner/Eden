@@ -10,6 +10,10 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+func LoadConfig(configPath string) (BlogConfig, error) {
+	return loadConfig(configPath)
+}
+
 func loadConfig(configPath string) (BlogConfig, error) {
 	if err := ensureDefaultConfig(configPath); err != nil {
 		return BlogConfig{}, err
@@ -48,6 +52,7 @@ func defaultConfig() BlogConfig {
 			Subtitle:    "技术与生活",
 			Description: "专注于 Java 与工程实践的技术博客",
 			Icon:        "site/favicon.svg",
+			BaseURL:     "http://localhost:20260",
 		},
 		Footer: FooterConfig{
 			Copyright: "© 2026 Anner. All rights reserved.",
@@ -75,6 +80,22 @@ func defaultConfig() BlogConfig {
 				"新文章发布即时通知",
 			},
 			PrivacyNote: "您的邮箱信息将被严格保密",
+		},
+		Mail: MailConfig{
+			Enabled:       false,
+			SMTPHost:      "",
+			SMTPPort:      587,
+			Username:      "",
+			Password:      "",
+			From:          "",
+			Encryption:    "starttls",
+			SubjectPrefix: "[博客更新] ",
+		},
+		System: SystemConfig{
+			ScanIntervalSeconds: 60,
+		},
+		Logging: LoggingConfig{
+			Level: "INFO",
 		},
 	}
 }

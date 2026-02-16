@@ -23,18 +23,41 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const scanInterval = 60 * time.Second
+const defaultScanInterval = 60 * time.Second
+
+type StoreOptions struct {
+	ScanInterval  time.Duration
+	OnNewArticles func([]Article)
+}
 
 type Store struct {
 	db      *sql.DB
 	dataDir string
 
-	mu       sync.RWMutex
-	notes    map[string]Article
-	noteTree []ArticleTreeNode
+	mu            sync.RWMutex
+	notes         map[string]Article
+	noteTree      []ArticleTreeNode
+	scanInterval  time.Duration
+	onNewArticles func([]Article)
 }
 
-func openStore(dbPath string) (*Store, error) {
+func (s *Store) SetOnNewArticles(handler func([]Article)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onNewArticles = handler
+}
+
+func (s *Store) SetScanInterval(interval time.Duration) {
+	if interval <= 0 {
+		interval = defaultScanInterval
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scanInterval = interval
+	LogInfof("store", "scan interval updated to %s", interval)
+}
+
+func openStore(dbPath string, options StoreOptions) (*Store, error) {
 	dataDir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, err
@@ -45,10 +68,17 @@ func openStore(dbPath string) (*Store, error) {
 		return nil, err
 	}
 
+	scanInterval := options.ScanInterval
+	if scanInterval <= 0 {
+		scanInterval = defaultScanInterval
+	}
+
 	store := &Store{
-		db:      db,
-		dataDir: dataDir,
-		notes:   map[string]Article{},
+		db:            db,
+		dataDir:       dataDir,
+		notes:         map[string]Article{},
+		scanInterval:  scanInterval,
+		onNewArticles: options.OnNewArticles,
 	}
 	if err = store.initSchema(); err != nil {
 		return nil, err
@@ -146,13 +176,20 @@ CREATE TABLE IF NOT EXISTS comment_like_events (
 
 CREATE TABLE IF NOT EXISTS subscribers (
     email TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_sent_at TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT ''
 );
 `
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
-	return s.migrateCommentsSchema()
+	if err := s.migrateCommentsSchema(); err != nil {
+		return err
+	}
+	return s.migrateSubscribersSchema()
 }
 
 func (s *Store) migrateCommentsSchema() error {
@@ -189,7 +226,11 @@ func (s *Store) migrateCommentsSchema() error {
 }
 
 func (s *Store) commentColumnExists(columnName string) (bool, error) {
-	rows, err := s.db.Query("PRAGMA table_info(comments)")
+	return s.tableColumnExists("comments", columnName)
+}
+
+func (s *Store) tableColumnExists(tableName string, columnName string) (bool, error) {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
 	if err != nil {
 		return false, err
 	}
@@ -212,17 +253,95 @@ func (s *Store) commentColumnExists(columnName string) (bool, error) {
 	return false, nil
 }
 
+func (s *Store) migrateSubscribersSchema() error {
+	activeExists, err := s.tableColumnExists("subscribers", "active")
+	if err != nil {
+		return err
+	}
+	if !activeExists {
+		if _, err = s.db.Exec("ALTER TABLE subscribers ADD COLUMN active INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return err
+		}
+	}
+
+	updatedExists, err := s.tableColumnExists("subscribers", "updated_at")
+	if err != nil {
+		return err
+	}
+	if !updatedExists {
+		if _, err = s.db.Exec("ALTER TABLE subscribers ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+
+	lastSentExists, err := s.tableColumnExists("subscribers", "last_sent_at")
+	if err != nil {
+		return err
+	}
+	if !lastSentExists {
+		if _, err = s.db.Exec("ALTER TABLE subscribers ADD COLUMN last_sent_at TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+
+	lastErrorExists, err := s.tableColumnExists("subscribers", "last_error")
+	if err != nil {
+		return err
+	}
+	if !lastErrorExists {
+		if _, err = s.db.Exec("ALTER TABLE subscribers ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	if _, err = s.db.Exec("UPDATE subscribers SET active = 1 WHERE active IS NULL"); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec("UPDATE subscribers SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = ''"); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec("UPDATE subscribers SET created_at = ? WHERE created_at IS NULL OR created_at = ''", now); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec("CREATE INDEX IF NOT EXISTS idx_subscribers_active ON subscribers(active)"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (s *Store) startAutoScan() {
 	go func() {
-		ticker := time.NewTicker(scanInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			_ = s.scanAndSync()
+		for {
+			s.mu.RLock()
+			interval := s.scanInterval
+			s.mu.RUnlock()
+			if interval <= 0 {
+				interval = defaultScanInterval
+			}
+			timer := time.NewTimer(interval)
+			<-timer.C
+			if err := s.scanAndSyncWithNotify(true); err != nil {
+				LogErrorf("store", "auto scan failed: %v", err)
+			}
 		}
 	}()
 }
 
 func (s *Store) scanAndSync() error {
+	return s.scanAndSyncWithNotify(false)
+}
+
+func (s *Store) scanAndSyncWithNotify(notifyNew bool) error {
+	existingIDs := map[string]struct{}{}
+	if notifyNew {
+		var err error
+		existingIDs, err = s.loadCurrentMetadataIDs()
+		if err != nil {
+			return err
+		}
+	}
+
 	articles, err := s.scanNotesFromDisk()
 	if err != nil {
 		return err
@@ -243,6 +362,35 @@ func (s *Store) scanAndSync() error {
 	s.notes = next
 	s.noteTree = tree
 	s.mu.Unlock()
+
+	if notifyNew {
+		s.mu.RLock()
+		hook := s.onNewArticles
+		s.mu.RUnlock()
+		if hook == nil {
+			return nil
+		}
+		newArticles := make([]Article, 0)
+		for _, article := range articles {
+			if _, exists := existingIDs[article.ID]; exists {
+				continue
+			}
+			newArticles = append(newArticles, article)
+		}
+		if len(newArticles) > 0 {
+			preview := make([]string, 0, 3)
+			for _, item := range newArticles {
+				preview = append(preview, item.ID)
+				if len(preview) >= 3 {
+					break
+				}
+			}
+			LogInfof("store", "detected %d new articles, preview_ids=%s", len(newArticles), strings.Join(preview, ","))
+			payload := make([]Article, len(newArticles))
+			copy(payload, newArticles)
+			go hook(payload)
+		}
+	}
 	return nil
 }
 
@@ -608,6 +756,69 @@ func (s *Store) ListArticleTree() ([]ArticleTreeNode, error) {
 	return cloneTree(s.noteTree), nil
 }
 
+func (s *Store) ListTagTree() ([]TagTreeNode, error) {
+	rows, err := s.db.Query(`
+SELECT h.tag_path, h.tag_name, h.parent_path, h.level, COALESCE(v.icon, '')
+FROM note_tag_hierarchy h
+LEFT JOIN note_visual_metadata v ON v.node_id = ('folder:' || h.tag_path)
+ORDER BY h.level ASC, h.tag_path ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	type rowData struct {
+		Path   string
+		Name   string
+		Parent string
+		Level  int
+		Icon   string
+	}
+	items := make([]rowData, 0)
+	for rows.Next() {
+		var item rowData
+		if err = rows.Scan(&item.Path, &item.Name, &item.Parent, &item.Level, &item.Icon); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+
+	nodeMap := map[string]*tagTreeBuilder{}
+	for _, item := range items {
+		nodeMap[item.Path] = &tagTreeBuilder{
+			ID:       "folder:" + item.Path,
+			Name:     item.Name,
+			Path:     item.Path,
+			Level:    item.Level,
+			Icon:     item.Icon,
+			Children: []*tagTreeBuilder{},
+		}
+	}
+
+	roots := make([]*tagTreeBuilder, 0)
+	for _, item := range items {
+		node := nodeMap[item.Path]
+		if strings.TrimSpace(item.Parent) == "" {
+			roots = append(roots, node)
+			continue
+		}
+		parent, ok := nodeMap[item.Parent]
+		if !ok {
+			roots = append(roots, node)
+			continue
+		}
+		parent.Children = append(parent.Children, node)
+	}
+
+	result := make([]TagTreeNode, 0, len(roots))
+	for _, root := range roots {
+		result = append(result, buildTagTreeNode(root))
+	}
+	sortTagTreeNodes(result)
+	return result, nil
+}
+
 func (s *Store) ListRecentArticles(limit int) ([]Article, error) {
 	if limit <= 0 {
 		limit = 20
@@ -970,11 +1181,68 @@ func (s *Store) AddSubscriber(email string) error {
 	if email == "" {
 		return errors.New("email is required")
 	}
+	now := time.Now().Format(time.RFC3339)
 	_, err := s.db.Exec(
-		"INSERT OR IGNORE INTO subscribers(email, created_at) VALUES(?, ?)",
+		`INSERT INTO subscribers(email, active, created_at, updated_at)
+VALUES(?, 1, ?, ?)
+ON CONFLICT(email) DO UPDATE SET active = 1, updated_at = excluded.updated_at`,
 		email,
-		time.Now().Format(time.RFC3339),
+		now,
+		now,
 	)
+	if err != nil {
+		LogErrorf("store", "add subscriber failed, email=%s, err=%v", email, err)
+		return err
+	}
+	LogInfof("store", "subscriber upsert success, email=%s", email)
+	return err
+}
+
+func (s *Store) ListActiveSubscribers() ([]Subscriber, error) {
+	rows, err := s.db.Query(`
+SELECT email, active, created_at, updated_at, last_sent_at, last_error
+FROM subscribers
+WHERE active = 1
+ORDER BY created_at ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]Subscriber, 0)
+	for rows.Next() {
+		var item Subscriber
+		var activeInt int
+		if err = rows.Scan(
+			&item.Email,
+			&activeInt,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.LastSentAt,
+			&item.LastError,
+		); err != nil {
+			return nil, err
+		}
+		item.Active = activeInt == 1
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func (s *Store) UpdateSubscriberDelivery(email string, sendAt string, sendErr string) error {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return errors.New("email is required")
+	}
+	_, err := s.db.Exec(`
+UPDATE subscribers
+SET updated_at = ?, last_sent_at = ?, last_error = ?
+WHERE email = ?
+`, time.Now().Format(time.RFC3339), sendAt, sendErr, email)
+	if err != nil {
+		LogErrorf("store", "update subscriber delivery failed, email=%s, err=%v", email, err)
+	}
 	return err
 }
 
@@ -1441,6 +1709,15 @@ type treeBuilder struct {
 	Children  map[string]*treeBuilder
 }
 
+type tagTreeBuilder struct {
+	ID       string
+	Name     string
+	Path     string
+	Level    int
+	Icon     string
+	Children []*tagTreeBuilder
+}
+
 func toTreeNodes(children map[string]*treeBuilder) []ArticleTreeNode {
 	keys := make([]string, 0, len(children))
 	for key := range children {
@@ -1484,6 +1761,35 @@ func cloneTree(nodes []ArticleTreeNode) []ArticleTreeNode {
 	return result
 }
 
+func buildTagTreeNode(source *tagTreeBuilder) TagTreeNode {
+	node := TagTreeNode{
+		ID:       source.ID,
+		Name:     source.Name,
+		Path:     source.Path,
+		Level:    source.Level,
+		Icon:     source.Icon,
+		Children: []TagTreeNode{},
+	}
+	for _, child := range source.Children {
+		node.Children = append(node.Children, buildTagTreeNode(child))
+	}
+	return node
+}
+
+func sortTagTreeNodes(nodes []TagTreeNode) {
+	sort.Slice(nodes, func(i int, j int) bool {
+		left := nodes[i]
+		right := nodes[j]
+		if left.Level != right.Level {
+			return left.Level < right.Level
+		}
+		return left.Name < right.Name
+	})
+	for index := range nodes {
+		sortTagTreeNodes(nodes[index].Children)
+	}
+}
+
 func (s *Store) loadViewMap() (map[string]int, error) {
 	rows, err := s.db.Query("SELECT id, views FROM note_runtime_metadata")
 	if err != nil {
@@ -1520,6 +1826,24 @@ func (s *Store) loadCreatedAtMap() (map[string]string, error) {
 		createdAtMap[id] = createdAt
 	}
 	return createdAtMap, nil
+}
+
+func (s *Store) loadCurrentMetadataIDs() (map[string]struct{}, error) {
+	rows, err := s.db.Query("SELECT id FROM note_metadata")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := map[string]struct{}{}
+	for rows.Next() {
+		var id string
+		if err = rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		result[id] = struct{}{}
+	}
+	return result, nil
 }
 
 func (s *Store) syncRuntimeMetadataTx(tx *sql.Tx, articles []Article) error {

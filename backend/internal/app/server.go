@@ -29,6 +29,7 @@ type Server struct {
 	configPath  string
 	config      BlogConfig
 	webDir      string
+	mailer      *SubscriptionMailer
 	mux         *http.ServeMux
 	limiter     *ActionLimiter
 	createLimit int
@@ -43,7 +44,10 @@ func NewServer(options ServerOptions) (*Server, error) {
 	}
 
 	dbPath := filepath.Join(options.DataDir, "blog.db")
-	store, err := openStore(dbPath)
+	scanInterval := resolveScanInterval(config)
+	store, err := openStore(dbPath, StoreOptions{
+		ScanInterval: scanInterval,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -59,6 +63,9 @@ func NewServer(options ServerOptions) (*Server, error) {
 		likeLimit:   defaultIfZero(options.CommentLikeLimit, 60),
 		rateWindow:  defaultDuration(options.RateLimitWindow, time.Minute),
 	}
+	server.mailer = NewSubscriptionMailer(config, store)
+	store.SetOnNewArticles(server.handleNewArticlesDetected)
+	LogInfof("server", "server initialized, data_dir=%s, scan_interval=%s", options.DataDir, scanInterval)
 	server.registerRoutes()
 	return server, nil
 }
@@ -74,12 +81,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/articles", s.handleListArticles)
 	s.mux.HandleFunc("GET /api/v1/articles/recent", s.handleListRecentArticles)
 	s.mux.HandleFunc("GET /api/v1/articles/tree", s.handleListArticleTree)
+	s.mux.HandleFunc("GET /api/v1/tags/tree", s.handleListTagTree)
 	s.mux.HandleFunc("GET /api/v1/articles/search", s.handleSearchArticles)
 	s.mux.HandleFunc("GET /api/v1/articles/{id}", s.handleGetArticle)
-	s.mux.HandleFunc("POST /api/v1/articles", s.handleCreateArticle)
-	s.mux.HandleFunc("PUT /api/v1/articles/{id}", s.handleUpdateArticle)
-	s.mux.HandleFunc("PATCH /api/v1/articles/{id}/move", s.handleMoveArticle)
-	s.mux.HandleFunc("DELETE /api/v1/articles/{id}", s.handleDeleteArticle)
 	s.mux.HandleFunc("GET /api/v1/comments", s.handleListComments)
 	s.mux.HandleFunc("POST /api/v1/comments", s.handleCreateComment)
 	s.mux.HandleFunc("POST /api/v1/comments/{id}/like", s.handleLikeComment)
@@ -100,15 +104,36 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	var payload BlogConfig
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		LogWarnf("server", "update config payload decode failed: %v", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err := saveConfig(s.configPath, payload); err != nil {
+		LogErrorf("server", "save config failed: %v", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	s.config = payload
+	scanInterval := resolveScanInterval(payload)
+	s.store.SetScanInterval(scanInterval)
+	SetLogLevel(payload.Logging.Level)
+	if s.mailer != nil {
+		s.mailer.UpdateConfig(payload)
+	}
+	LogInfof("server", "config updated, scan_interval=%s, log_level=%s", scanInterval, payload.Logging.Level)
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) handleNewArticlesDetected(articles []Article) {
+	if len(articles) == 0 {
+		return
+	}
+	LogInfof("server", "detected %d new articles", len(articles))
+	if s.mailer == nil {
+		LogWarnf("server", "subscription mailer not initialized")
+		return
+	}
+	s.mailer.EnqueueNewArticles(articles)
 }
 
 func (s *Server) handleListArticles(w http.ResponseWriter, _ *http.Request) {
@@ -142,6 +167,15 @@ func (s *Server) handleListRecentArticles(w http.ResponseWriter, r *http.Request
 
 func (s *Server) handleListArticleTree(w http.ResponseWriter, _ *http.Request) {
 	tree, err := s.store.ListArticleTree()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tree)
+}
+
+func (s *Server) handleListTagTree(w http.ResponseWriter, _ *http.Request) {
+	tree, err := s.store.ListTagTree()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -339,13 +373,16 @@ func (s *Server) handleGetDataAsset(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var payload SubscribeRequest
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		LogWarnf("server", "subscribe payload decode failed: %v", err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	if err := s.store.AddSubscriber(payload.Email); err != nil {
+		LogWarnf("server", "subscribe failed, email=%s, err=%v", payload.Email, err)
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	LogInfof("server", "new subscription accepted, email=%s", payload.Email)
 	writeJSON(w, http.StatusCreated, map[string]string{"email": payload.Email, "status": "subscribed"})
 }
 
@@ -408,6 +445,14 @@ func defaultDuration(value time.Duration, defaultValue time.Duration) time.Durat
 		return defaultValue
 	}
 	return value
+}
+
+func resolveScanInterval(config BlogConfig) time.Duration {
+	seconds := config.System.ScanIntervalSeconds
+	if seconds <= 0 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func clientIP(r *http.Request) string {

@@ -8,6 +8,7 @@ type SiteConfig struct {
 	Subtitle    string `json:"subtitle" toml:"subtitle"`
 	Description string `json:"description" toml:"description"`
 	Icon        string `json:"icon" toml:"icon"`
+	BaseURL     string `json:"base_url" toml:"base_url"`
 }
 
 type FooterConfig struct {
@@ -36,11 +37,33 @@ type SubscribeConfig struct {
 	PrivacyNote string   `json:"privacy_note" toml:"privacy_note"`
 }
 
+type MailConfig struct {
+	Enabled       bool   `json:"enabled" toml:"enabled"`
+	SMTPHost      string `json:"smtp_host" toml:"smtp_host"`
+	SMTPPort      int    `json:"smtp_port" toml:"smtp_port"`
+	Username      string `json:"username" toml:"username"`
+	Password      string `json:"-" toml:"password"`
+	From          string `json:"from" toml:"from"`
+	Encryption    string `json:"encryption" toml:"encryption"`
+	SubjectPrefix string `json:"subject_prefix" toml:"subject_prefix"`
+}
+
+type SystemConfig struct {
+	ScanIntervalSeconds int `json:"scan_interval_seconds" toml:"scan_interval_seconds"`
+}
+
+type LoggingConfig struct {
+	Level string `json:"level" toml:"level"`
+}
+
 type BlogConfig struct {
 	Site      SiteConfig      `json:"site" toml:"site"`
 	Footer    FooterConfig    `json:"footer" toml:"footer"`
 	Profile   ProfileConfig   `json:"profile" toml:"profile"`
 	Subscribe SubscribeConfig `json:"subscribe" toml:"subscribe"`
+	Mail      MailConfig      `json:"mail" toml:"mail"`
+	System    SystemConfig    `json:"system" toml:"system"`
+	Logging   LoggingConfig   `json:"logging" toml:"logging"`
 }
 
 type Article struct {
@@ -71,6 +94,15 @@ type ArticleTreeNode struct {
 	Children  []ArticleTreeNode `json:"children,omitempty"`
 }
 
+type TagTreeNode struct {
+	ID       string        `json:"id"`
+	Name     string        `json:"name"`
+	Path     string        `json:"path"`
+	Level    int           `json:"level"`
+	Icon     string        `json:"icon,omitempty"`
+	Children []TagTreeNode `json:"children,omitempty"`
+}
+
 type MoveArticleRequest struct {
 	ParentID   string `json:"parent_id"`
 	OrderIndex int    `json:"order_index"`
@@ -96,4 +128,13 @@ type ProfileStats struct {
 	Articles int `json:"articles"`
 	Views    int `json:"views"`
 	Years    int `json:"years"`
+}
+
+type Subscriber struct {
+	Email      string `json:"email"`
+	Active     bool   `json:"active"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+	LastSentAt string `json:"last_sent_at,omitempty"`
+	LastError  string `json:"last_error,omitempty"`
 }

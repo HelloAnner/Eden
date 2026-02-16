@@ -3,6 +3,7 @@ title = "Agent"
 subtitle = "技术与生活"
 description = "专注于 Agent 工程、MCP、工作流编排与知识自动化的技术博客"
 icon = "site/favicon.svg"
+base_url = "http://localhost:20260"
 
 [footer]
 copyright = "© 2026 Anner. All rights reserved."
@@ -30,3 +31,19 @@ benefits = [
   "独家技术资料和学习资源",
   "新文章发布即时通知",
 ]
+
+[mail]
+enabled = false
+smtp_host = ""
+smtp_port = 587
+username = ""
+password = ""
+from = ""
+encryption = "starttls"
+subject_prefix = "[博客更新] "
+
+[system]
+scan_interval_seconds = 60
+
+[logging]
+level = "INFO"

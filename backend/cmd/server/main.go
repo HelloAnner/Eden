@@ -4,7 +4,7 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,7 +20,18 @@ func main() {
 	configPath := envOrDefault("CONFIG_PATH", filepath.Join(rootDir, "config.toml"))
 	dataDir := envOrDefault("DATA_DIR", filepath.Join(rootDir, "data"))
 	webDir := envOrDefault("WEB_DIR", filepath.Join(rootDir, "web"))
+	logDir := envOrDefault("LOG_DIR", filepath.Join(rootDir, "logs"))
 	port := envOrDefault("PORT", "20260")
+	config, err := app.LoadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load config failed: %v\n", err)
+		os.Exit(1)
+	}
+	if err = app.InitLogger(logDir, config.Logging.Level); err != nil {
+		fmt.Fprintf(os.Stderr, "init logger failed: %v\n", err)
+		os.Exit(1)
+	}
+	app.LogInfof("bootstrap", "logger initialized, level=%s, dir=%s", config.Logging.Level, logDir)
 
 	server, err := app.NewServer(app.ServerOptions{
 		ConfigPath: configPath,
@@ -28,12 +39,14 @@ func main() {
 		WebDir:     webDir,
 	})
 	if err != nil {
-		log.Fatalf("initialize server failed: %v", err)
+		app.LogErrorf("bootstrap", "initialize server failed: %v", err)
+		os.Exit(1)
 	}
 
-	log.Printf("blog server listening on :%s", port)
+	app.LogInfof("bootstrap", "blog server listening on :%s", port)
 	if err = http.ListenAndServe(":"+port, server.Handler()); err != nil {
-		log.Fatalf("start server failed: %v", err)
+		app.LogErrorf("bootstrap", "start server failed: %v", err)
+		os.Exit(1)
 	}
 }
 
@@ -41,10 +54,10 @@ func configureTimezone() {
 	zone := envOrDefault("TZ", "Asia/Shanghai")
 	location, err := time.LoadLocation(zone)
 	if err != nil {
-		log.Printf("load timezone failed: %v, fallback to Asia/Shanghai", err)
+		app.LogWarnf("bootstrap", "load timezone failed: %v, fallback to Asia/Shanghai", err)
 		location, err = time.LoadLocation("Asia/Shanghai")
 		if err != nil {
-			log.Printf("fallback timezone failed: %v", err)
+			app.LogWarnf("bootstrap", "fallback timezone failed: %v", err)
 			return
 		}
 	}

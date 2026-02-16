@@ -29,6 +29,12 @@ export function HomePage({ articleId = 'java-generics-deep-dive' }: HomePageProp
     if (!targetArticleId) {
       return
     }
+    const mainContainer = document.querySelector('main')
+    if (mainContainer instanceof HTMLElement) {
+      mainContainer.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    } else {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' })
+    }
     let mounted = true
     getArticle(targetArticleId)
       .then((result) => {

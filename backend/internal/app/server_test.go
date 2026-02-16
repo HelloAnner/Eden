@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -299,7 +300,7 @@ func TestParseTagsFallbackToDefault(t *testing.T) {
 	}
 }
 
-func TestArticleCRUDAndTree(t *testing.T) {
+func TestArticleWriteAPIsDisabled(t *testing.T) {
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.toml")
 	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
@@ -315,96 +316,181 @@ func TestArticleCRUDAndTree(t *testing.T) {
 		t.Fatalf("create server failed: %v", err)
 	}
 
-	createBody := map[string]any{
-		"parent_id":    "",
-		"title":        "新文章",
-		"slug":         "new-article",
-		"category":     "技术笔记",
-		"path":         "技术笔记/自动化",
-		"excerpt":      "摘要",
-		"content":      "正文",
-		"published_at": "2026-02-16",
-		"read_minutes": 5,
-		"views":        10,
-		"order_index":  1,
-	}
-	createPayload, _ := json.Marshal(createBody)
-	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/articles", bytes.NewReader(createPayload))
-	createReq.Header.Set("Content-Type", "application/json")
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/articles", bytes.NewReader([]byte(`{"title":"x"}`)))
 	createRec := httptest.NewRecorder()
 	server.Handler().ServeHTTP(createRec, createReq)
-	if createRec.Code != http.StatusCreated {
-		t.Fatalf("create article expected 201, got %d", createRec.Code)
+	if createRec.Code != http.StatusNotFound {
+		t.Fatalf("create article api should be removed, expected 404, got %d", createRec.Code)
 	}
-	var created Article
-	if err = json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("parse create response failed: %v", err)
+
+	updateReq := httptest.NewRequest(http.MethodPut, "/api/v1/articles/demo-id", bytes.NewReader([]byte(`{"title":"x"}`)))
+	updateRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(updateRec, updateReq)
+	if updateRec.Code != http.StatusNotFound {
+		t.Fatalf("update article api should be removed, expected 404, got %d", updateRec.Code)
 	}
-	if created.ID == "" {
-		t.Fatalf("created article id should not be empty")
+
+	moveReq := httptest.NewRequest(http.MethodPatch, "/api/v1/articles/demo-id/move", bytes.NewReader([]byte(`{"parent_id":"A/B"}`)))
+	moveRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(moveRec, moveReq)
+	if moveRec.Code != http.StatusNotFound {
+		t.Fatalf("move article api should be removed, expected 404, got %d", moveRec.Code)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/articles/demo-id", nil)
+	deleteRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusNotFound {
+		t.Fatalf("delete article api should be removed, expected 404, got %d", deleteRec.Code)
+	}
+}
+
+func TestFolderSyncBuildsIDAndUpdatesSQLite(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	seedMarkdownNote(t, tempDir, "Agent工程/同步测试", "文件夹新增笔记", "这是文件夹新增的内容")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	articleID := findArticleIDByPathTitle(t, server.store, "Agent工程/同步测试", "文件夹新增笔记")
+	if strings.TrimSpace(articleID) == "" {
+		t.Fatalf("article id should not be empty")
 	}
 
 	var mappedID string
 	err = server.store.db.QueryRow(
 		"SELECT id FROM note_identity_map WHERE note_path = ? AND note_title = ?",
-		"技术笔记/自动化",
-		"新文章",
+		"Agent工程/同步测试",
+		"文件夹新增笔记",
 	).Scan(&mappedID)
 	if err != nil {
 		t.Fatalf("query identity map failed: %v", err)
 	}
-	if mappedID != created.ID {
-		t.Fatalf("identity map id mismatch, expected=%s, actual=%s", created.ID, mappedID)
+	if mappedID != articleID {
+		t.Fatalf("identity map mismatch, expected=%s, actual=%s", articleID, mappedID)
 	}
-	var tagCount int
-	err = server.store.db.QueryRow("SELECT COUNT(1) FROM note_tag_hierarchy WHERE tag_path = ?", "技术笔记/自动化").Scan(&tagCount)
+
+	var metadataCount int
+	err = server.store.db.QueryRow(
+		"SELECT COUNT(1) FROM note_metadata WHERE id = ? AND path = ? AND title = ?",
+		articleID,
+		"Agent工程/同步测试",
+		"文件夹新增笔记",
+	).Scan(&metadataCount)
 	if err != nil {
-		t.Fatalf("query tag hierarchy failed: %v", err)
+		t.Fatalf("query metadata failed: %v", err)
 	}
-	if tagCount != 1 {
-		t.Fatalf("expected tag hierarchy to contain 技术笔记/自动化")
+	if metadataCount != 1 {
+		t.Fatalf("metadata should be synced from folder scan")
+	}
+}
+
+func TestFolderSyncDetectsNewFileAfterStartup(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	seedMarkdownNote(t, tempDir, "Agent工程/启动前", "已有笔记", "启动前已有内容")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
 	}
 
-	treeReq := httptest.NewRequest(http.MethodGet, "/api/v1/articles/tree", nil)
-	treeRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(treeRec, treeReq)
-	if treeRec.Code != http.StatusOK {
-		t.Fatalf("tree expected 200, got %d", treeRec.Code)
+	seedMarkdownNote(t, tempDir, "Agent工程/启动后新增", "新笔记", "这是新增文件")
+	if err = server.store.scanAndSync(); err != nil {
+		t.Fatalf("scan and sync failed: %v", err)
 	}
 
-	var treeData []map[string]any
-	if err := json.Unmarshal(treeRec.Body.Bytes(), &treeData); err != nil {
-		t.Fatalf("tree parse failed: %v", err)
-	}
-	if len(treeData) == 0 {
-		t.Fatalf("tree should contain at least one article")
+	newID := findArticleIDByPathTitle(t, server.store, "Agent工程/启动后新增", "新笔记")
+	if strings.TrimSpace(newID) == "" {
+		t.Fatalf("new note id should not be empty")
 	}
 
-	updateBody := map[string]any{
-		"title":        "新文章-已更新",
-		"slug":         "new-article",
-		"category":     "技术笔记",
-		"excerpt":      "更新摘要",
-		"content":      "更新正文",
-		"published_at": "2026-02-16",
-		"read_minutes": 6,
-		"views":        11,
-		"order_index":  2,
+	var count int
+	if err = server.store.db.QueryRow(
+		"SELECT COUNT(1) FROM note_identity_map WHERE id = ? AND note_path = ? AND note_title = ?",
+		newID,
+		"Agent工程/启动后新增",
+		"新笔记",
+	).Scan(&count); err != nil {
+		t.Fatalf("query identity map failed: %v", err)
 	}
-	updatePayload, _ := json.Marshal(updateBody)
-	updateReq := httptest.NewRequest(http.MethodPut, "/api/v1/articles/"+created.ID, bytes.NewReader(updatePayload))
-	updateReq.Header.Set("Content-Type", "application/json")
-	updateRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(updateRec, updateReq)
-	if updateRec.Code != http.StatusOK {
-		t.Fatalf("update article expected 200, got %d", updateRec.Code)
+	if count != 1 {
+		t.Fatalf("new note should sync into identity map")
+	}
+}
+
+func TestListTagTree(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	seedMarkdownNote(t, tempDir, "Agent工程/后端/Go", "Go 工程实践", "后端文章")
+	seedMarkdownNote(t, tempDir, "Agent工程/前端/React", "React 工程实践", "前端文章")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
 	}
 
-	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/articles/"+created.ID, nil)
-	deleteRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(deleteRec, deleteReq)
-	if deleteRec.Code != http.StatusNoContent {
-		t.Fatalf("delete article expected 204, got %d", deleteRec.Code)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/tags/tree", nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tags tree expected 200, got %d", rec.Code)
+	}
+
+	var tree []TagTreeNode
+	if err = json.Unmarshal(rec.Body.Bytes(), &tree); err != nil {
+		t.Fatalf("parse tag tree failed: %v", err)
+	}
+	if len(tree) != 1 {
+		t.Fatalf("expected 1 root tag, got %d", len(tree))
+	}
+	root := tree[0]
+	if root.Path != "Agent工程" || root.Name != "Agent工程" {
+		t.Fatalf("unexpected root tag: %+v", root)
+	}
+	if root.Level != 1 {
+		t.Fatalf("root level should be 1, got %d", root.Level)
+	}
+	if len(root.Children) == 0 {
+		t.Fatalf("root children should not be empty")
+	}
+
+	hasBackend := false
+	hasFrontend := false
+	for _, child := range root.Children {
+		if child.Path == "Agent工程/后端" && child.Name == "后端" {
+			hasBackend = true
+		}
+		if child.Path == "Agent工程/前端" && child.Name == "前端" {
+			hasFrontend = true
+		}
+	}
+	if !hasBackend || !hasFrontend {
+		t.Fatalf("expected backend and frontend tags, hasBackend=%v, hasFrontend=%v", hasBackend, hasFrontend)
 	}
 }
 
@@ -414,6 +500,7 @@ func TestRecentArticlesAndTimestamps(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
 		t.Fatalf("write config failed: %v", err)
 	}
+	seedMarkdownNote(t, tempDir, "技术笔记/最近更新", "最近更新文章", "最近更新测试正文")
 
 	server, err := NewServer(ServerOptions{
 		ConfigPath: configPath,
@@ -423,30 +510,7 @@ func TestRecentArticlesAndTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create server failed: %v", err)
 	}
-
-	createBody := map[string]any{
-		"title":       "最近更新文章",
-		"category":    "技术笔记",
-		"path":        "技术笔记/最近更新",
-		"excerpt":     "最近更新测试摘要",
-		"content":     "最近更新测试正文",
-		"order_index": 1,
-	}
-	createPayload, _ := json.Marshal(createBody)
-	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/articles", bytes.NewReader(createPayload))
-	createReq.Header.Set("Content-Type", "application/json")
-	createRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(createRec, createReq)
-	if createRec.Code != http.StatusCreated {
-		t.Fatalf("create article expected 201, got %d", createRec.Code)
-	}
-	var created Article
-	if err = json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
-		t.Fatalf("parse create response failed: %v", err)
-	}
-	if created.ID == "" {
-		t.Fatalf("created article id should not be empty")
-	}
+	createdID := findArticleIDByPathTitle(t, server.store, "技术笔记/最近更新", "最近更新文章")
 
 	listReq1 := httptest.NewRequest(http.MethodGet, "/api/v1/articles/recent?limit=5", nil)
 	listRec1 := httptest.NewRecorder()
@@ -466,7 +530,7 @@ func TestRecentArticlesAndTimestamps(t *testing.T) {
 	var createdAtBefore string
 	var updatedAtBefore string
 	for _, item := range recent1 {
-		if item["id"] == created.ID {
+		if item["id"] == createdID {
 			createdAtBefore, _ = item["created_at"].(string)
 			updatedAtBefore, _ = item["updated_at"].(string)
 			break
@@ -478,21 +542,13 @@ func TestRecentArticlesAndTimestamps(t *testing.T) {
 
 	time.Sleep(2 * time.Second)
 
-	updateBody := map[string]any{
-		"title":       "最近更新文章-改",
-		"category":    "技术笔记",
-		"path":        "技术笔记/最近更新",
-		"excerpt":     "最近更新测试摘要-改",
-		"content":     "最近更新测试正文-改",
-		"order_index": 1,
+	noteFile := filepath.Join(tempDir, "notes", "技术笔记", "最近更新", "最近更新文章.md")
+	updatedContent := "# 最近更新文章\n\n最近更新测试正文-改\n\n#技术笔记/最近更新\n"
+	if err = os.WriteFile(noteFile, []byte(updatedContent), 0644); err != nil {
+		t.Fatalf("update markdown failed: %v", err)
 	}
-	updatePayload, _ := json.Marshal(updateBody)
-	updateReq := httptest.NewRequest(http.MethodPut, "/api/v1/articles/"+created.ID, bytes.NewReader(updatePayload))
-	updateReq.Header.Set("Content-Type", "application/json")
-	updateRec := httptest.NewRecorder()
-	server.Handler().ServeHTTP(updateRec, updateReq)
-	if updateRec.Code != http.StatusOK {
-		t.Fatalf("update article expected 200, got %d", updateRec.Code)
+	if err = server.store.scanAndSync(); err != nil {
+		t.Fatalf("scan and sync failed after markdown update: %v", err)
 	}
 
 	listReq2 := httptest.NewRequest(http.MethodGet, "/api/v1/articles/recent?limit=5", nil)
@@ -510,7 +566,7 @@ func TestRecentArticlesAndTimestamps(t *testing.T) {
 	var createdAtAfter string
 	var updatedAtAfter string
 	for _, item := range recent2 {
-		if item["id"] == created.ID {
+		if item["id"] == createdID {
 			createdAtAfter, _ = item["created_at"].(string)
 			updatedAtAfter, _ = item["updated_at"].(string)
 			break
