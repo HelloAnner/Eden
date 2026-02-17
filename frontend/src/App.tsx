@@ -1,15 +1,18 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 
 import { AppShell } from '@/components/layout/app-shell'
 import { applyFavicon, resolveDataAssetUrl } from '@/lib/asset'
 import { getArticleTree, getConfig } from '@/lib/api'
-import { HomePage } from '@/pages/home-page'
-import { ProfilePage } from '@/pages/profile-page'
-import { RecentUpdatesPage } from '@/pages/recent-updates-page'
-import { SearchPage } from '@/pages/search-page'
-import { SubscribePage } from '@/pages/subscribe-page'
 import type { BlogConfig, NoteTreeNode } from '@/types'
+
+const HomePage = lazy(() => import('@/pages/home-page').then((module) => ({ default: module.HomePage })))
+const ProfilePage = lazy(() => import('@/pages/profile-page').then((module) => ({ default: module.ProfilePage })))
+const RecentUpdatesPage = lazy(() =>
+  import('@/pages/recent-updates-page').then((module) => ({ default: module.RecentUpdatesPage })),
+)
+const SearchPage = lazy(() => import('@/pages/search-page').then((module) => ({ default: module.SearchPage })))
+const SubscribePage = lazy(() => import('@/pages/subscribe-page').then((module) => ({ default: module.SubscribePage })))
 
 const fallbackConfig: BlogConfig = {
   site: {
@@ -67,17 +70,23 @@ function App() {
   return (
     <BrowserRouter>
       <AppShell config={config} noteTree={noteTree}>
-        <Routes>
-          <Route path="/" element={<RecentUpdatesPage />} />
-          <Route path="/article/:articleId" element={<HomePage />} />
-          <Route path="/profile" element={<ProfilePage config={config} />} />
-          <Route path="/subscribe" element={<SubscribePage config={config} />} />
-          <Route path="/search" element={<SearchPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <Suspense fallback={<RouteLoading />}>
+          <Routes>
+            <Route path="/" element={<RecentUpdatesPage />} />
+            <Route path="/article/:articleId" element={<HomePage />} />
+            <Route path="/profile" element={<ProfilePage config={config} />} />
+            <Route path="/subscribe" element={<SubscribePage config={config} />} />
+            <Route path="/search" element={<SearchPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
       </AppShell>
     </BrowserRouter>
   )
+}
+
+function RouteLoading() {
+  return <div className="p-8 text-sm text-[#5E6573]">页面加载中...</div>
 }
 
 export default App

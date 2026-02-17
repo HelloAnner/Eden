@@ -48,6 +48,7 @@ export type Article = {
   tags: string[]
   excerpt: string
   content: string
+  rendered_html?: string
   published_at: string
   read_minutes: number
   views: number

@@ -7,7 +7,8 @@
 - 编码: `UTF-8`
 - 文章来源: `data/notes/{标签树}/{标题}.md`
 - 同步原则: 以文件夹和 Markdown 文件为唯一事实来源
-- ID 规则: 后端按 `path + title` 自动生成稳定 `id`，并写入 `note_identity_map`
+- ID 规则: 后端按 `title` 自动生成稳定 `id`，并写入 `note_identity_map`
+  - 同标题默认视为全局唯一；若检测到重名文件，后端会自动退化到 `path+title` 兜底并记录告警日志
 - 标签层级: 按目录自动同步到 `note_tag_hierarchy`
 
 ## 1. 获取文章树（含文件夹 + 文章）
@@ -68,7 +69,7 @@
 - 任意文件夹变更（新增/修改/删除笔记）都会在扫描后同步到 SQLite
 - 同步到 SQLite:
   - `note_metadata`: 文章基础元数据
-  - `note_identity_map`: `path+title -> id` 映射
+  - `note_identity_map`: `title -> id` 映射（标题全局唯一）
   - `note_tag_hierarchy`: 标签目录树层级
   - `note_visual_metadata`: 左侧节点图标
   - `note_runtime_metadata`: 阅读次数等运行时数据

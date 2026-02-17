@@ -5,6 +5,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	cryptorand "crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -20,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
 	_ "modernc.org/sqlite"
 )
 
@@ -67,6 +70,9 @@ func openStore(dbPath string, options StoreOptions) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err = applySQLitePragmas(db); err != nil {
+		return nil, err
+	}
 
 	scanInterval := options.ScanInterval
 	if scanInterval <= 0 {
@@ -112,12 +118,16 @@ CREATE TABLE IF NOT EXISTS note_metadata (
     order_index INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
+    rendered_html TEXT NOT NULL DEFAULT '',
     source_file TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_note_metadata_category ON note_metadata(category);
 CREATE INDEX IF NOT EXISTS idx_note_metadata_path ON note_metadata(path);
 CREATE INDEX IF NOT EXISTS idx_note_metadata_published_at ON note_metadata(published_at);
+CREATE INDEX IF NOT EXISTS idx_note_metadata_updated_created_order ON note_metadata(updated_at DESC, created_at DESC, order_index ASC);
+CREATE INDEX IF NOT EXISTS idx_note_metadata_path_title ON note_metadata(path, title);
 
 CREATE TABLE IF NOT EXISTS note_identity_map (
     id TEXT PRIMARY KEY,
@@ -129,6 +139,7 @@ CREATE TABLE IF NOT EXISTS note_identity_map (
 );
 
 CREATE INDEX IF NOT EXISTS idx_note_identity_map_path_title ON note_identity_map(note_path, note_title);
+CREATE INDEX IF NOT EXISTS idx_note_identity_map_title ON note_identity_map(note_title);
 
 CREATE TABLE IF NOT EXISTS note_tag_hierarchy (
     tag_path TEXT PRIMARY KEY,
@@ -165,6 +176,7 @@ CREATE TABLE IF NOT EXISTS comments (
 );
 
 CREATE INDEX IF NOT EXISTS idx_comments_article ON comments(article_id);
+CREATE INDEX IF NOT EXISTS idx_comments_article_created ON comments(article_id, created_at);
 
 CREATE TABLE IF NOT EXISTS comment_like_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,10 +198,67 @@ CREATE TABLE IF NOT EXISTS subscribers (
 	if _, err := s.db.Exec(schema); err != nil {
 		return err
 	}
+	if err := s.migrateNoteMetadataSchema(); err != nil {
+		return err
+	}
 	if err := s.migrateCommentsSchema(); err != nil {
 		return err
 	}
 	return s.migrateSubscribersSchema()
+}
+
+func applySQLitePragmas(db *sql.DB) error {
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
+		return err
+	}
+	if _, err := db.Exec("PRAGMA synchronous = NORMAL"); err != nil {
+		return err
+	}
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		return err
+	}
+	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
+		return err
+	}
+	if _, err := db.Exec("PRAGMA temp_store = MEMORY"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) migrateNoteMetadataSchema() error {
+	contentHashExists, err := s.tableColumnExists("note_metadata", "content_hash")
+	if err != nil {
+		return err
+	}
+	if !contentHashExists {
+		if _, err = s.db.Exec("ALTER TABLE note_metadata ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	renderedHTMLExists, err := s.tableColumnExists("note_metadata", "rendered_html")
+	if err != nil {
+		return err
+	}
+	if !renderedHTMLExists {
+		if _, err = s.db.Exec("ALTER TABLE note_metadata ADD COLUMN rendered_html TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
+	if _, err = s.db.Exec("CREATE INDEX IF NOT EXISTS idx_note_metadata_updated_created_order ON note_metadata(updated_at DESC, created_at DESC, order_index ASC)"); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec("CREATE INDEX IF NOT EXISTS idx_note_metadata_path_title ON note_metadata(path, title)"); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec("CREATE INDEX IF NOT EXISTS idx_note_identity_map_title ON note_identity_map(note_title)"); err != nil {
+		return err
+	}
+	if _, err = s.db.Exec("CREATE INDEX IF NOT EXISTS idx_comments_article_created ON comments(article_id, created_at)"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) migrateCommentsSchema() error {
@@ -404,6 +473,7 @@ func (s *Store) scanNotesFromDisk() ([]Article, error) {
 		return nil, err
 	}
 	articles := make([]Article, 0)
+	titleSourceMap := map[string]string{}
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil
@@ -435,7 +505,16 @@ func (s *Store) scanNotesFromDisk() ([]Article, error) {
 		if title == "" {
 			return nil
 		}
+		existingSource, exists := titleSourceMap[title]
+		duplicateTitle := exists && existingSource != path
+		if !exists {
+			titleSourceMap[title] = path
+		}
 		key := buildPathTitleKey(notePath, title)
+		if duplicateTitle {
+			key = buildPathTitleLegacyKey(notePath, title)
+			LogWarnf("store", "duplicate title detected, fallback to path+title key, title=%s, source=%s, duplicate=%s", title, existingSource, path)
+		}
 		noteID := strings.TrimSpace(identityMap[key])
 		if noteID == "" {
 			noteID = generateNoteID(key)
@@ -522,6 +601,10 @@ func (s *Store) syncMetadata(articles []Article) error {
 	if err != nil {
 		return err
 	}
+	renderCacheMap, err := s.loadRenderCacheMap()
+	if err != nil {
+		return err
+	}
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -534,8 +617,8 @@ func (s *Store) syncMetadata(articles []Article) error {
 	}
 
 	statement, err := tx.Prepare(`
-INSERT INTO note_metadata(id, title, slug, category, path, tags_json, excerpt, published_at, read_minutes, views, order_index, created_at, updated_at, source_file)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO note_metadata(id, title, slug, category, path, tags_json, excerpt, published_at, read_minutes, views, order_index, created_at, updated_at, content_hash, rendered_html, source_file)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `)
 	if err != nil {
 		return err
@@ -554,6 +637,13 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		}
 		articles[index].CreatedAt = createdAt
 		viewCount := viewMap[article.ID]
+		contentHash := calcContentHash(article.Content)
+		renderedHTML := renderCacheMap[article.ID].HTML
+		if renderedHTML == "" || renderCacheMap[article.ID].Hash != contentHash {
+			renderedHTML = renderArticleHTMLForCache(article)
+		}
+		articles[index].ContentHash = contentHash
+		articles[index].RenderedHTML = renderedHTML
 		sourceFile := strings.TrimSpace(article.SourceFile)
 		if sourceFile == "" {
 			sourceFile = s.buildNoteFilePath(article.Path, article.Title)
@@ -572,6 +662,8 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			article.OrderIndex,
 			createdAt,
 			article.UpdatedAt,
+			contentHash,
+			renderedHTML,
 			sourceFile,
 		); err != nil {
 			return err
@@ -741,9 +833,6 @@ ORDER BY order_index ASC
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(tagsJSON), &article.Tags)
-		if note, ok := s.notes[article.ID]; ok {
-			article.Content = note.Content
-		}
 		article.Views = viewMap[article.ID]
 		articles = append(articles, article)
 	}
@@ -868,9 +957,6 @@ LIMIT ?
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(tagsJSON), &article.Tags)
-		if note, ok := s.notes[article.ID]; ok {
-			article.Content = note.Content
-		}
 		article.Views = viewMap[article.ID]
 		items = append(items, article)
 	}
@@ -921,9 +1007,6 @@ ORDER BY order_index ASC
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(tagsJSON), &article.Tags)
-		if note, ok := s.notes[article.ID]; ok {
-			article.Content = note.Content
-		}
 		article.Views = viewMap[article.ID]
 		results = append(results, article)
 	}
@@ -1413,6 +1496,10 @@ func isMarkdownFile(path string) bool {
 }
 
 func buildPathTitleKey(path string, title string) string {
+	return strings.TrimSpace(title)
+}
+
+func buildPathTitleLegacyKey(path string, title string) string {
 	return strings.TrimSpace(path) + "\n" + strings.TrimSpace(title)
 }
 
@@ -1435,8 +1522,11 @@ func (s *Store) loadPathTitleIDMap() (map[string]string, error) {
 			if scanErr := rows.Scan(&notePath, &noteTitle, &id); scanErr != nil {
 				return nil, scanErr
 			}
-			key := buildPathTitleKey(notePath, noteTitle)
-			result[key] = id
+			titleKey := buildPathTitleKey(notePath, noteTitle)
+			if _, exists := result[titleKey]; !exists {
+				result[titleKey] = id
+			}
+			result[buildPathTitleLegacyKey(notePath, noteTitle)] = id
 		}
 	}
 
@@ -1452,9 +1542,13 @@ func (s *Store) loadPathTitleIDMap() (map[string]string, error) {
 		if scanErr := rows.Scan(&notePath, &noteTitle, &id); scanErr != nil {
 			return nil, scanErr
 		}
-		key := buildPathTitleKey(notePath, noteTitle)
-		if _, exists := result[key]; !exists {
-			result[key] = id
+		titleKey := buildPathTitleKey(notePath, noteTitle)
+		if _, exists := result[titleKey]; !exists {
+			result[titleKey] = id
+		}
+		legacyKey := buildPathTitleLegacyKey(notePath, noteTitle)
+		if _, exists := result[legacyKey]; !exists {
+			result[legacyKey] = id
 		}
 	}
 	return result, nil
@@ -1826,6 +1920,48 @@ func (s *Store) loadCreatedAtMap() (map[string]string, error) {
 		createdAtMap[id] = createdAt
 	}
 	return createdAtMap, nil
+}
+
+type renderCacheEntry struct {
+	Hash string
+	HTML string
+}
+
+func (s *Store) loadRenderCacheMap() (map[string]renderCacheEntry, error) {
+	rows, err := s.db.Query("SELECT id, content_hash, rendered_html FROM note_metadata")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cache := map[string]renderCacheEntry{}
+	for rows.Next() {
+		var id string
+		var hash string
+		var html string
+		if err = rows.Scan(&id, &hash, &html); err != nil {
+			return nil, err
+		}
+		cache[id] = renderCacheEntry{Hash: hash, HTML: html}
+	}
+	return cache, nil
+}
+
+func calcContentHash(content string) string {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(content))
+	return fmt.Sprintf("%x", hash.Sum64())
+}
+
+func renderArticleHTMLForCache(article Article) string {
+	preprocessed := preprocessObsidianForEmail(article.Content, article.Title, article.ID, "")
+	var rendered bytes.Buffer
+	md := goldmark.New(goldmark.WithExtensions(extension.GFM))
+	if err := md.Convert([]byte(preprocessed), &rendered); err != nil {
+		LogWarnf("store", "render html failed, article=%s, err=%v", article.ID, err)
+		return ""
+	}
+	return rendered.String()
 }
 
 func (s *Store) loadCurrentMetadataIDs() (map[string]struct{}, error) {

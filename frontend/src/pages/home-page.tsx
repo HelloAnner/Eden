@@ -196,7 +196,7 @@ export function HomePage({ articleId = 'java-generics-deep-dive' }: HomePageProp
 
       <div className="flex flex-col gap-10 lg:flex-row lg:gap-12">
         <div className="min-w-0 flex-1 space-y-6">
-          <ObsidianRenderer markdown={renderedMarkdown} />
+          <ObsidianRenderer markdown={renderedMarkdown} renderedHtml={article.rendered_html} />
 
           <section className="border-t border-[#E5E7EB] pt-8">
             <div className="mb-6 flex items-center gap-2">

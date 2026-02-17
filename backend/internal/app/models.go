@@ -67,22 +67,24 @@ type BlogConfig struct {
 }
 
 type Article struct {
-	ID          string   `json:"id"`
-	ParentID    string   `json:"parent_id"`
-	Title       string   `json:"title"`
-	Slug        string   `json:"slug"`
-	Category    string   `json:"category"`
-	Path        string   `json:"path"`
-	Tags        []string `json:"tags"`
-	Excerpt     string   `json:"excerpt"`
-	Content     string   `json:"content"`
-	PublishedAt string   `json:"published_at"`
-	ReadMinutes int      `json:"read_minutes"`
-	Views       int      `json:"views"`
-	OrderIndex  int      `json:"order_index"`
-	CreatedAt   string   `json:"created_at,omitempty"`
-	UpdatedAt   string   `json:"updated_at,omitempty"`
-	SourceFile  string   `json:"-"`
+	ID           string   `json:"id"`
+	ParentID     string   `json:"parent_id"`
+	Title        string   `json:"title"`
+	Slug         string   `json:"slug"`
+	Category     string   `json:"category"`
+	Path         string   `json:"path"`
+	Tags         []string `json:"tags"`
+	Excerpt      string   `json:"excerpt"`
+	Content      string   `json:"content,omitempty"`
+	RenderedHTML string   `json:"rendered_html,omitempty"`
+	PublishedAt  string   `json:"published_at"`
+	ReadMinutes  int      `json:"read_minutes"`
+	Views        int      `json:"views"`
+	OrderIndex   int      `json:"order_index"`
+	CreatedAt    string   `json:"created_at,omitempty"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
+	ContentHash  string   `json:"-"`
+	SourceFile   string   `json:"-"`
 }
 
 type ArticleTreeNode struct {

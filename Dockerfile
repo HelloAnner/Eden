@@ -5,6 +5,11 @@ COPY frontend/package*.json ./
 RUN npm ci
 COPY frontend ./
 RUN npm run build
+RUN apk add --no-cache brotli && \
+    find dist -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' -o -name '*.txt' -o -name '*.xml' -o -name '*.map' \) | while read -r file; do \
+      brotli -f -q 11 "$file" -o "$file.br"; \
+      gzip -f -k -9 "$file"; \
+    done
 
 FROM m.daocloud.io/docker.io/library/golang:1.24-alpine AS backend-build
 WORKDIR /workspace/backend

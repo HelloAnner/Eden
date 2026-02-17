@@ -154,6 +154,183 @@ func TestServeProfileAvatarFromDataDir(t *testing.T) {
 	}
 }
 
+func TestSPACacheHeaders(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	webDir := filepath.Join(tempDir, "web")
+	if err := os.MkdirAll(filepath.Join(webDir, "assets"), 0755); err != nil {
+		t.Fatalf("mkdir web dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<html><body>index</body></html>"), 0644); err != nil {
+		t.Fatalf("write index failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "assets", "main-ABCDEF12.js"), []byte("console.log('ok')"), 0644); err != nil {
+		t.Fatalf("write asset failed: %v", err)
+	}
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     webDir,
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	indexReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	indexRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(indexRec, indexReq)
+	if indexRec.Code != http.StatusOK {
+		t.Fatalf("index expected 200, got %d", indexRec.Code)
+	}
+	if cacheControl := indexRec.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "no-cache") {
+		t.Fatalf("index cache-control should be no-cache, got %q", cacheControl)
+	}
+
+	assetReq := httptest.NewRequest(http.MethodGet, "/assets/main-ABCDEF12.js", nil)
+	assetRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(assetRec, assetReq)
+	if assetRec.Code != http.StatusOK {
+		t.Fatalf("asset expected 200, got %d", assetRec.Code)
+	}
+	if cacheControl := assetRec.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "immutable") {
+		t.Fatalf("hashed asset should be immutable cache, got %q", cacheControl)
+	}
+}
+
+func TestDataAssetETagCache(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	assetDir := filepath.Join(tempDir, "profile")
+	if err := os.MkdirAll(assetDir, 0755); err != nil {
+		t.Fatalf("mkdir asset dir failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(assetDir, "avatar.png"), []byte("avatar-bytes"), 0644); err != nil {
+		t.Fatalf("write avatar failed: %v", err)
+	}
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/v1/data/profile/avatar.png", nil)
+	firstRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first request expected 200, got %d", firstRec.Code)
+	}
+	etag := firstRec.Header().Get("ETag")
+	if strings.TrimSpace(etag) == "" {
+		t.Fatalf("etag should be set")
+	}
+	if cacheControl := firstRec.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "max-age=86400") {
+		t.Fatalf("unexpected data asset cache-control: %q", cacheControl)
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/v1/data/profile/avatar.png", nil)
+	secondReq.Header.Set("If-None-Match", etag)
+	secondRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusNotModified {
+		t.Fatalf("second request expected 304, got %d", secondRec.Code)
+	}
+}
+
+func TestTagTreeETagCache(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	seedMarkdownNote(t, tempDir, "Agent工程/缓存", "缓存测试", "测试缓存")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/v1/tags/tree", nil)
+	firstRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first request expected 200, got %d", firstRec.Code)
+	}
+	etag := strings.TrimSpace(firstRec.Header().Get("ETag"))
+	if etag == "" {
+		t.Fatalf("etag should exist for tags tree")
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/v1/tags/tree", nil)
+	secondReq.Header.Set("If-None-Match", etag)
+	secondRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusNotModified {
+		t.Fatalf("second request expected 304, got %d", secondRec.Code)
+	}
+}
+
+func TestServePrecompressedAssetWhenSupported(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	webDir := filepath.Join(tempDir, "web")
+	if err := os.MkdirAll(filepath.Join(webDir, "assets"), 0755); err != nil {
+		t.Fatalf("mkdir web dir failed: %v", err)
+	}
+	originPath := filepath.Join(webDir, "assets", "main-ABCDEF12.js")
+	brPath := originPath + ".br"
+	if err := os.WriteFile(originPath, []byte("origin-data"), 0644); err != nil {
+		t.Fatalf("write origin file failed: %v", err)
+	}
+	if err := os.WriteFile(brPath, []byte("compressed-data"), 0644); err != nil {
+		t.Fatalf("write br file failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<html>ok</html>"), 0644); err != nil {
+		t.Fatalf("write index failed: %v", err)
+	}
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     webDir,
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/assets/main-ABCDEF12.js", nil)
+	req.Header.Set("Accept-Encoding", "br, gzip")
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if encoding := rec.Header().Get("Content-Encoding"); encoding != "br" {
+		t.Fatalf("expected br encoding, got %q", encoding)
+	}
+	if vary := rec.Header().Get("Vary"); !strings.Contains(vary, "Accept-Encoding") {
+		t.Fatalf("expected vary accept-encoding header, got %q", vary)
+	}
+}
+
 func TestCommentReplyLikeAndRateLimit(t *testing.T) {
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "config.toml")
@@ -580,6 +757,275 @@ func TestRecentArticlesAndTimestamps(t *testing.T) {
 	}
 	if updatedAtAfter == updatedAtBefore {
 		t.Fatalf("updated_at should change after update")
+	}
+}
+
+func TestArticleDetailContainsRenderedHTML(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	seedMarkdownNote(t, tempDir, "Agent工程/渲染缓存", "渲染缓存测试", "正文内容\n\n- 列表项")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	articleID := findArticleIDByPathTitle(t, server.store, "Agent工程/渲染缓存", "渲染缓存测试")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/articles/"+articleID, nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var payload map[string]any
+	if err = json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal payload failed: %v", err)
+	}
+	articleMap, ok := payload["article"].(map[string]any)
+	if !ok {
+		t.Fatalf("article payload missing")
+	}
+	rendered, _ := articleMap["rendered_html"].(string)
+	if strings.TrimSpace(rendered) == "" {
+		t.Fatalf("rendered_html should not be empty")
+	}
+}
+
+func TestArticleDetailETagInvalidationAfterMarkdownChange(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	tagPath := "Agent工程/失效机制"
+	title := "失效机制测试"
+	seedMarkdownNote(t, tempDir, tagPath, title, "第一版内容")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+	articleID := findArticleIDByPathTitle(t, server.store, tagPath, title)
+
+	firstReq := httptest.NewRequest(http.MethodGet, "/api/v1/articles/"+articleID, nil)
+	firstRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first request expected 200, got %d", firstRec.Code)
+	}
+	firstETag := strings.TrimSpace(firstRec.Header().Get("ETag"))
+	if firstETag == "" {
+		t.Fatalf("first etag should not be empty")
+	}
+
+	secondReq := httptest.NewRequest(http.MethodGet, "/api/v1/articles/"+articleID, nil)
+	secondReq.Header.Set("If-None-Match", firstETag)
+	secondRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusNotModified {
+		t.Fatalf("second request expected 304, got %d", secondRec.Code)
+	}
+
+	noteFile := filepath.Join(tempDir, "notes", filepath.FromSlash(tagPath), title+".md")
+	updatedBody := "# " + title + "\n\n第二版内容\n\n#" + tagPath + "\n"
+	if err = os.WriteFile(noteFile, []byte(updatedBody), 0644); err != nil {
+		t.Fatalf("write updated markdown failed: %v", err)
+	}
+	if err = server.store.scanAndSync(); err != nil {
+		t.Fatalf("scan and sync failed after markdown update: %v", err)
+	}
+
+	thirdReq := httptest.NewRequest(http.MethodGet, "/api/v1/articles/"+articleID, nil)
+	thirdReq.Header.Set("If-None-Match", firstETag)
+	thirdRec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(thirdRec, thirdReq)
+	if thirdRec.Code != http.StatusOK {
+		t.Fatalf("third request expected 200 after update, got %d", thirdRec.Code)
+	}
+	thirdETag := strings.TrimSpace(thirdRec.Header().Get("ETag"))
+	if thirdETag == "" {
+		t.Fatalf("third etag should not be empty")
+	}
+	if thirdETag == firstETag {
+		t.Fatalf("etag should change after markdown content update")
+	}
+}
+
+func TestArticleIDStableWhenContentChanges(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	tagPath := "Agent工程/固定ID"
+	title := "固定ID测试"
+	seedMarkdownNote(t, tempDir, tagPath, title, "第一版正文内容")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	oldID := findArticleIDByPathTitle(t, server.store, tagPath, title)
+	if strings.TrimSpace(oldID) == "" {
+		t.Fatalf("old id should not be empty")
+	}
+
+	noteFile := filepath.Join(tempDir, "notes", filepath.FromSlash(tagPath), title+".md")
+	updatedBody := "# 这是新的一级标题（文件名不变）\n\n第二版正文内容\n\n#" + tagPath + "\n"
+	if err = os.WriteFile(noteFile, []byte(updatedBody), 0644); err != nil {
+		t.Fatalf("write updated markdown failed: %v", err)
+	}
+	if err = server.store.scanAndSync(); err != nil {
+		t.Fatalf("scan and sync failed after content update: %v", err)
+	}
+
+	newID := findArticleIDByPathTitle(t, server.store, tagPath, title)
+	if newID != oldID {
+		t.Fatalf("id should stay stable when title unchanged, old=%s, new=%s", oldID, newID)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/articles/"+oldID, nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("old shared link should still work, expected 200 got %d", rec.Code)
+	}
+}
+
+func TestArticleIDStableWhenMarkdownMovedToAnotherPath(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	oldPath := "Agent工程/原目录"
+	newPath := "Agent工程/新目录"
+	title := "移动后ID保持"
+	seedMarkdownNote(t, tempDir, oldPath, title, "原目录正文")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	oldID := findArticleIDByPathTitle(t, server.store, oldPath, title)
+	if strings.TrimSpace(oldID) == "" {
+		t.Fatalf("old id should not be empty")
+	}
+
+	oldFile := filepath.Join(tempDir, "notes", filepath.FromSlash(oldPath), title+".md")
+	newDir := filepath.Join(tempDir, "notes", filepath.FromSlash(newPath))
+	if err = os.MkdirAll(newDir, 0755); err != nil {
+		t.Fatalf("mkdir new dir failed: %v", err)
+	}
+	newFile := filepath.Join(newDir, title+".md")
+	if err = os.Rename(oldFile, newFile); err != nil {
+		t.Fatalf("move markdown failed: %v", err)
+	}
+	if err = server.store.scanAndSync(); err != nil {
+		t.Fatalf("scan and sync after move failed: %v", err)
+	}
+
+	newID := findArticleIDByPathTitle(t, server.store, newPath, title)
+	if newID != oldID {
+		t.Fatalf("id should stay stable when note moved, old=%s, new=%s", oldID, newID)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/articles/"+oldID, nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("old shared link should still work after move, expected 200 got %d", rec.Code)
+	}
+}
+
+func TestRecentArticlesSlimPayloadWithoutContent(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+	seedMarkdownNote(t, tempDir, "Agent工程/列表瘦身", "瘦身测试", "这是正文，列表不应携带完整内容")
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/articles/recent?limit=10", nil)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var items []map[string]any
+	if err = json.Unmarshal(rec.Body.Bytes(), &items); err != nil {
+		t.Fatalf("unmarshal recent payload failed: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatalf("recent list should not be empty")
+	}
+	if _, exists := items[0]["content"]; exists {
+		t.Fatalf("recent payload should not include content field")
+	}
+}
+
+func TestSQLitePragmasApplied(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.toml")
+	if err := os.WriteFile(configPath, []byte("[site]\ntitle=\"Blog\"\n"), 0644); err != nil {
+		t.Fatalf("write config failed: %v", err)
+	}
+
+	server, err := NewServer(ServerOptions{
+		ConfigPath: configPath,
+		DataDir:    tempDir,
+		WebDir:     "",
+	})
+	if err != nil {
+		t.Fatalf("create server failed: %v", err)
+	}
+
+	var journalMode string
+	if err = server.store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal_mode failed: %v", err)
+	}
+	if !strings.EqualFold(strings.TrimSpace(journalMode), "wal") {
+		t.Fatalf("journal_mode should be WAL, got %q", journalMode)
+	}
+
+	var busyTimeout int
+	if err = server.store.db.QueryRow("PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		t.Fatalf("query busy_timeout failed: %v", err)
+	}
+	if busyTimeout < 5000 {
+		t.Fatalf("busy_timeout should be >= 5000, got %d", busyTimeout)
 	}
 }
 

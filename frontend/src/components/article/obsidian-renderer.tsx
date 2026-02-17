@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import 'katex/dist/katex.min.css'
 import ReactMarkdown from 'react-markdown'
 import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
@@ -9,9 +10,19 @@ import { slugifyHeading } from '@/lib/obsidian'
 
 type ObsidianRendererProps = {
   markdown: string
+  renderedHtml?: string
 }
 
-export function ObsidianRenderer({ markdown }: ObsidianRendererProps) {
+export function ObsidianRenderer({ markdown, renderedHtml }: ObsidianRendererProps) {
+  if (renderedHtml && renderedHtml.trim().length > 0) {
+    return (
+      <article
+        className="space-y-4 text-[#5E6573] [&_a]:text-[#3141F5] [&_a]:underline [&_a]:decoration-[#CBD5E1] [&_a]:underline-offset-2 [&_a:hover]:decoration-[#3141F5] [&_blockquote]:rounded-r-lg [&_blockquote]:border-l-4 [&_blockquote]:border-[#3141F5] [&_blockquote]:bg-[#F7FAFF] [&_blockquote]:px-4 [&_blockquote]:py-3 [&_blockquote]:text-[15px] [&_blockquote]:leading-[1.8] [&_blockquote]:text-[#3F4A5A] [&_code]:rounded [&_code]:bg-[#F4F7FA] [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:text-[13px] [&_code]:text-[#1E293B] [&_h1]:scroll-mt-24 [&_h1]:text-[28px] [&_h1]:font-semibold [&_h1]:leading-[1.4] [&_h1]:text-[#181A1B] [&_h2]:scroll-mt-24 [&_h2]:text-[24px] [&_h2]:font-semibold [&_h2]:leading-[1.4] [&_h2]:text-[#181A1B] [&_h3]:scroll-mt-24 [&_h3]:text-[20px] [&_h3]:font-semibold [&_h3]:leading-[1.4] [&_h3]:text-[#181A1B] [&_h4]:scroll-mt-24 [&_h4]:text-[18px] [&_h4]:font-semibold [&_h4]:leading-[1.4] [&_h4]:text-[#181A1B] [&_h5]:scroll-mt-24 [&_h5]:text-[16px] [&_h5]:font-semibold [&_h5]:leading-[1.4] [&_h5]:text-[#181A1B] [&_h6]:scroll-mt-24 [&_h6]:text-[15px] [&_h6]:font-semibold [&_h6]:leading-[1.4] [&_h6]:text-[#181A1B] [&_hr]:my-8 [&_hr]:border-[#E5E7EB] [&_img]:max-h-[460px] [&_img]:rounded-lg [&_img]:border [&_img]:border-[#E5E7EB] [&_img]:bg-white [&_img]:object-contain [&_li]:marker:text-[#A1A1AA] [&_ol]:list-decimal [&_ol]:space-y-2 [&_ol]:pl-6 [&_ol]:text-base [&_ol]:leading-[1.8] [&_ol]:text-[#5E6573] [&_p]:text-base [&_p]:leading-[1.8] [&_p]:text-[#5E6573] [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:border [&_pre]:border-[#E2E8F0] [&_pre]:bg-[#F8FAFC] [&_pre]:p-5 [&_pre]:text-sm [&_pre]:leading-[1.6] [&_pre]:text-[#0F172A] [&_table]:w-full [&_table]:border-collapse [&_table]:text-sm [&_tbody_tr]:border-b [&_tbody_tr]:border-[#E5E7EB] [&_td]:px-3 [&_td]:py-2 [&_td]:text-[#5E6573] [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold [&_th]:text-[#181A1B] [&_thead]:bg-[#F4F7FA] [&_ul]:list-disc [&_ul]:space-y-2 [&_ul]:pl-6 [&_ul]:text-base [&_ul]:leading-[1.8] [&_ul]:text-[#5E6573]"
+        dangerouslySetInnerHTML={{ __html: renderedHtml }}
+      />
+    )
+  }
+
   return (
     <article className="space-y-4 text-[#5E6573]">
       <ReactMarkdown

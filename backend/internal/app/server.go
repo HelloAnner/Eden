@@ -7,9 +7,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"hash/fnv"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +40,8 @@ type Server struct {
 	likeLimit   int
 	rateWindow  time.Duration
 }
+
+var hashedAssetPattern = regexp.MustCompile(`-[0-9A-Za-z_-]{8,}\.`)
 
 func NewServer(options ServerOptions) (*Server, error) {
 	config, err := loadConfig(options.ConfigPath)
@@ -97,8 +103,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (s *Server) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, s.config)
+func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	writeCachedJSON(w, r, s.config, "public, max-age=300, must-revalidate")
 }
 
 func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
@@ -136,13 +142,13 @@ func (s *Server) handleNewArticlesDetected(articles []Article) {
 	s.mailer.EnqueueNewArticles(articles)
 }
 
-func (s *Server) handleListArticles(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleListArticles(w http.ResponseWriter, r *http.Request) {
 	articles, err := s.store.ListArticles()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, articles)
+	writeCachedJSON(w, r, articles, "no-cache, must-revalidate")
 }
 
 func (s *Server) handleListRecentArticles(w http.ResponseWriter, r *http.Request) {
@@ -162,25 +168,25 @@ func (s *Server) handleListRecentArticles(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, articles)
+	writeCachedJSON(w, r, articles, "no-cache, must-revalidate")
 }
 
-func (s *Server) handleListArticleTree(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleListArticleTree(w http.ResponseWriter, r *http.Request) {
 	tree, err := s.store.ListArticleTree()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, tree)
+	writeCachedJSON(w, r, tree, "no-cache, must-revalidate")
 }
 
-func (s *Server) handleListTagTree(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleListTagTree(w http.ResponseWriter, r *http.Request) {
 	tree, err := s.store.ListTagTree()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, tree)
+	writeCachedJSON(w, r, tree, "no-cache, must-revalidate")
 }
 
 func (s *Server) handleSearchArticles(w http.ResponseWriter, r *http.Request) {
@@ -190,19 +196,15 @@ func (s *Server) handleSearchArticles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeCachedJSON(w, r, map[string]any{
 		"keyword": keyword,
 		"items":   articles,
 		"total":   len(articles),
-	})
+	}, "no-cache, must-revalidate")
 }
 
 func (s *Server) handleGetArticle(w http.ResponseWriter, r *http.Request) {
 	articleID := r.PathValue("id")
-	if err := s.store.IncrementView(articleID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
 	article, err := s.store.GetArticle(articleID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -216,6 +218,16 @@ func (s *Server) handleGetArticle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	etag := buildArticleETag(article, comments)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
+	if etagMatched(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	if err = s.store.IncrementView(articleID); err == nil {
+		article.Views++
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"article":  article,
@@ -293,7 +305,7 @@ func (s *Server) handleListComments(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, comments)
+	writeCachedJSON(w, r, comments, "no-cache, must-revalidate")
 }
 
 func (s *Server) handleCreateComment(w http.ResponseWriter, r *http.Request) {
@@ -367,6 +379,13 @@ func (s *Server) handleGetDataAsset(w http.ResponseWriter, r *http.Request) {
 		writeErrorMessage(w, http.StatusNotFound, "asset not found")
 		return
 	}
+	etag := buildFileETag(info)
+	w.Header().Set("ETag", etag)
+	applyDataAssetCacheHeaders(w, fullPath)
+	if etagMatched(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	http.ServeFile(w, r, fullPath)
 }
 
@@ -386,13 +405,13 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]string{"email": payload.Email, "status": "subscribed"})
 }
 
-func (s *Server) handleProfileStats(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleProfileStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.ProfileStats()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, stats)
+	writeCachedJSON(w, r, stats, "no-cache, must-revalidate")
 }
 
 func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
@@ -407,15 +426,27 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 
 	cleanPath := filepath.Clean(r.URL.Path)
 	if cleanPath == "." || cleanPath == "/" {
+		applyNoCacheHeaders(w)
 		http.ServeFile(w, r, filepath.Join(s.webDir, "index.html"))
 		return
 	}
 
 	target := filepath.Join(s.webDir, cleanPath)
 	if stat, err := os.Stat(target); err == nil && !stat.IsDir() {
+		applySPACacheHeaders(w, cleanPath)
+		if tryServePrecompressedAsset(w, r, cleanPath, target) {
+			return
+		}
+		etag := buildFileETag(stat)
+		w.Header().Set("ETag", etag)
+		if etagMatched(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		http.ServeFile(w, r, target)
 		return
 	}
+	applyNoCacheHeaders(w)
 	http.ServeFile(w, r, filepath.Join(s.webDir, "index.html"))
 }
 
@@ -423,6 +454,26 @@ func writeJSON(w http.ResponseWriter, code int, payload any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeCachedJSON(w http.ResponseWriter, r *http.Request, payload any, cacheControl string) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	etag := buildBytesETag(body)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if strings.TrimSpace(cacheControl) != "" {
+		w.Header().Set("Cache-Control", cacheControl)
+	}
+	w.Header().Set("ETag", etag)
+	if etagMatched(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func writeError(w http.ResponseWriter, code int, err error) {
@@ -511,4 +562,187 @@ func resolveDataAssetPath(store *Store, relativePath string) (string, error) {
 		return "", errors.New("invalid asset path")
 	}
 	return fullPath, nil
+}
+
+func applyNoCacheHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+}
+
+func applySPACacheHeaders(w http.ResponseWriter, requestPath string) {
+	normalized := filepath.ToSlash(strings.TrimSpace(requestPath))
+	ext := strings.ToLower(filepath.Ext(normalized))
+	if ext == ".html" {
+		applyNoCacheHeaders(w)
+		return
+	}
+	if hashedAssetPattern.MatchString(filepath.Base(normalized)) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=3600, must-revalidate")
+}
+
+func tryServePrecompressedAsset(w http.ResponseWriter, r *http.Request, requestPath string, targetPath string) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get("Range")) != "" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(requestPath))
+	if !isCompressibleAssetExt(ext) {
+		return false
+	}
+	for _, candidate := range []struct {
+		encoding string
+		suffix   string
+	}{
+		{encoding: "br", suffix: ".br"},
+		{encoding: "gzip", suffix: ".gz"},
+	} {
+		if !acceptsEncoding(r.Header.Get("Accept-Encoding"), candidate.encoding) {
+			continue
+		}
+		compressedPath := targetPath + candidate.suffix
+		info, err := os.Stat(compressedPath)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		appendVaryHeader(w, "Accept-Encoding")
+		w.Header().Set("Content-Encoding", candidate.encoding)
+		if contentType := mime.TypeByExtension(ext); contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		etag := buildFileETag(info)
+		w.Header().Set("ETag", etag)
+		if etagMatched(r.Header.Get("If-None-Match"), etag) {
+			w.WriteHeader(http.StatusNotModified)
+			return true
+		}
+		http.ServeFile(w, r, compressedPath)
+		return true
+	}
+	return false
+}
+
+func acceptsEncoding(header string, encoding string) bool {
+	if strings.TrimSpace(header) == "" {
+		return false
+	}
+	items := strings.Split(header, ",")
+	target := strings.ToLower(strings.TrimSpace(encoding))
+	for _, item := range items {
+		value := strings.ToLower(strings.TrimSpace(item))
+		if value == "" {
+			continue
+		}
+		if semi := strings.Index(value, ";"); semi >= 0 {
+			value = strings.TrimSpace(value[:semi])
+		}
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func appendVaryHeader(w http.ResponseWriter, key string) {
+	origin := w.Header().Get("Vary")
+	if origin == "" {
+		w.Header().Set("Vary", key)
+		return
+	}
+	parts := strings.Split(origin, ",")
+	needle := strings.ToLower(strings.TrimSpace(key))
+	for _, part := range parts {
+		if strings.ToLower(strings.TrimSpace(part)) == needle {
+			return
+		}
+	}
+	w.Header().Set("Vary", origin+", "+key)
+}
+
+func isCompressibleAssetExt(ext string) bool {
+	switch ext {
+	case ".html", ".js", ".css", ".json", ".svg", ".txt", ".xml", ".map":
+		return true
+	default:
+		return false
+	}
+}
+
+func applyDataAssetCacheHeaders(w http.ResponseWriter, fullPath string) {
+	ext := strings.ToLower(filepath.Ext(fullPath))
+	if isDataAssetTextExt(ext) {
+		w.Header().Set("Cache-Control", "public, max-age=300, must-revalidate")
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400, must-revalidate")
+}
+
+func isDataAssetTextExt(ext string) bool {
+	switch ext {
+	case ".md", ".txt", ".json", ".yaml", ".yml", ".toml":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildFileETag(info os.FileInfo) string {
+	return fmt.Sprintf(`W/"%x-%x"`, info.ModTime().UnixNano(), info.Size())
+}
+
+func buildBytesETag(data []byte) string {
+	hash := fnv.New64a()
+	_, _ = hash.Write(data)
+	return fmt.Sprintf(`W/"%x-%x"`, len(data), hash.Sum64())
+}
+
+func buildArticleETag(article Article, comments []Comment) string {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(article.ID))
+	_, _ = hash.Write([]byte("|"))
+	_, _ = hash.Write([]byte(article.ContentHash))
+	_, _ = hash.Write([]byte("|"))
+	_, _ = hash.Write([]byte(article.UpdatedAt))
+	for _, comment := range flattenComments(comments) {
+		_, _ = hash.Write([]byte("|"))
+		_, _ = hash.Write([]byte(strconv.FormatInt(comment.ID, 10)))
+		_, _ = hash.Write([]byte("|"))
+		_, _ = hash.Write([]byte(comment.UpdatedAt))
+		_, _ = hash.Write([]byte("|"))
+		_, _ = hash.Write([]byte(strconv.Itoa(comment.Likes)))
+	}
+	return fmt.Sprintf(`W/"article-%x"`, hash.Sum64())
+}
+
+func flattenComments(comments []Comment) []Comment {
+	items := make([]Comment, 0, len(comments))
+	for _, comment := range comments {
+		items = append(items, comment)
+		if len(comment.Replies) > 0 {
+			items = append(items, flattenComments(comment.Replies)...)
+		}
+	}
+	return items
+}
+
+func etagMatched(ifNoneMatch string, etag string) bool {
+	header := strings.TrimSpace(ifNoneMatch)
+	if header == "" {
+		return false
+	}
+	if header == "*" {
+		return true
+	}
+	items := strings.Split(header, ",")
+	for _, item := range items {
+		if strings.TrimSpace(item) == etag {
+			return true
+		}
+	}
+	return false
 }
